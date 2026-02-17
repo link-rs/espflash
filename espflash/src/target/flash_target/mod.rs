@@ -14,6 +14,7 @@ pub use self::{esp32::Esp32Target, ram::RamTarget};
 use crate::{Error, connection::{Connection, SerialInterface}, image_format::Segment};
 
 /// Flash target enum - either ESP32 flash or RAM.
+#[derive(Debug)]
 pub enum FlashTarget {
     /// Applications running from an ESP32's (or variant's) flash
     Esp32(Esp32Target),

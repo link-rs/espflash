@@ -29,7 +29,7 @@ use indicatif::{HumanCount, ProgressBar, style::ProgressStyle};
 use log::{debug, info, warn};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
-use serialport::{FlowControl, SerialPortInfo, SerialPortType, UsbPortInfo};
+use serialport::{FlowControl, SerialPortInfo, SerialPortType};
 
 use self::{
     config::Config,
@@ -38,6 +38,8 @@ use self::{
 use crate::{
     connection::{
         Connection,
+        Port,
+        PortInfo,
         reset::{ResetAfterOperation, ResetBeforeOperation},
     },
     error::{Error, MissingPartition, MissingPartitionTable},
@@ -410,7 +412,7 @@ pub fn connect(
     config: &Config,
     no_verify: bool,
     no_skip: bool,
-) -> Result<Flasher> {
+) -> Result<Flasher<Port>> {
     if args.before == ResetBeforeOperation::NoReset
         || args.before == ResetBeforeOperation::NoResetNoSync
     {
@@ -434,11 +436,11 @@ pub fn connect(
 
     // NOTE: since `serial_port_info` filters out all PCI Port and Bluetooth
     //       serial ports, we can just pretend these types don't exist here.
-    let port_info = match port_info.port_type {
-        SerialPortType::UsbPort(info) => info,
+    let port_info: PortInfo = match port_info.port_type {
+        SerialPortType::UsbPort(info) => info.into(),
         SerialPortType::PciPort | SerialPortType::Unknown => {
             debug!("Matched `SerialPortType::PciPort or ::Unknown`");
-            UsbPortInfo {
+            PortInfo {
                 vid: 0,
                 pid: 0,
                 serial_number: None,
@@ -458,14 +460,16 @@ pub fn connect(
             .or(config.project_config.baudrate)
             .unwrap_or(115_200),
     );
-    Ok(Flasher::connect(
+    pollster::block_on(Flasher::connect(
         connection,
         !args.no_stub,
         !no_verify,
         !no_skip,
         args.chip,
         args.baud.or(config.project_config.baudrate),
-    )?)
+    ))
+    .map_err(|(_, e)| e)
+    .into_diagnostic()
 }
 
 /// Connect to a target device and print information about its chip
@@ -475,13 +479,13 @@ pub fn board_info(args: &ConnectArgs, config: &Config) -> Result<()> {
 
     let chip = flasher.chip();
     if chip != Chip::Esp32 {
-        let security_info = flasher.security_info()?;
+        let security_info = pollster::block_on(flasher.security_info()).into_diagnostic()?;
         println!("{security_info}");
     } else {
         println!("Security features: None");
     }
 
-    flasher.connection().reset_after(!args.no_stub, chip)?;
+    pollster::block_on(flasher.connection().reset_after(!args.no_stub, chip)).into_diagnostic()?;
 
     Ok(())
 }
@@ -490,13 +494,16 @@ pub fn board_info(args: &ConnectArgs, config: &Config) -> Result<()> {
 pub fn checksum_md5(args: &ChecksumMd5Args, config: &Config) -> Result<()> {
     let mut flasher = connect(&args.connect_args, config, true, true)?;
 
-    let checksum = flasher.checksum_md5(args.address, args.size)?;
+    let checksum = pollster::block_on(flasher.checksum_md5(args.address, args.size)).into_diagnostic()?;
     println!("0x{checksum:x}");
 
     let chip = flasher.chip();
-    flasher
-        .connection()
-        .reset_after(!args.connect_args.no_stub, chip)?;
+    pollster::block_on(
+        flasher
+            .connection()
+            .reset_after(!args.connect_args.no_stub, chip),
+    )
+    .into_diagnostic()?;
 
     Ok(())
 }
@@ -615,8 +622,8 @@ pub fn parse_chip_rev(chip_rev: &str) -> Result<u16> {
 }
 
 /// Print information about a chip
-pub fn print_board_info(flasher: &mut Flasher) -> Result<DeviceInfo> {
-    let info = flasher.device_info()?;
+pub fn print_board_info(flasher: &mut Flasher<Port>) -> Result<DeviceInfo> {
+    let info = pollster::block_on(flasher.device_info()).into_diagnostic()?;
     print!("Chip type:         {}", info.chip);
 
     if let Some((major, minor)) = info.revision {
@@ -651,7 +658,7 @@ pub fn serial_monitor(args: MonitorArgs, config: &Config) -> Result<()> {
     };
 
     let chip = flasher.chip();
-    let dev_info = flasher.device_info()?;
+    let dev_info = pollster::block_on(flasher.device_info()).into_diagnostic()?;
 
     ensure_chip_compatibility(chip, firmware_elf.as_deref())?;
 
@@ -659,7 +666,7 @@ pub fn serial_monitor(args: MonitorArgs, config: &Config) -> Result<()> {
 
     // The 26MHz ESP32-C2's need to be treated as a special case.
     if chip == Chip::Esp32c2
-        && chip.xtal_frequency(flasher.connection())? == XtalFrequency::_26Mhz
+        && pollster::block_on(chip.xtal_frequency(flasher.connection())).into_diagnostic()? == XtalFrequency::_26Mhz
         && monitor_args.monitor_baud == 115_200
     {
         // 115_200 * 26 MHz / 40 MHz = 74_880
@@ -681,7 +688,7 @@ pub fn serial_monitor(args: MonitorArgs, config: &Config) -> Result<()> {
     }
 
     monitor(
-        flasher.into(),
+        flasher.into_connection().into_serial(),
         elfs,
         pid,
         monitor_args,
@@ -835,10 +842,13 @@ pub fn erase_flash(args: EraseFlashArgs, config: &Config) -> Result<()> {
 
     let chip = flasher.chip();
 
-    flasher.erase_flash()?;
-    flasher
-        .connection()
-        .reset_after(!args.connect_args.no_stub, chip)?;
+    pollster::block_on(flasher.erase_flash()).into_diagnostic()?;
+    pollster::block_on(
+        flasher
+            .connection()
+            .reset_after(!args.connect_args.no_stub, chip),
+    )
+    .into_diagnostic()?;
 
     info!("Flash has been erased!");
 
@@ -867,17 +877,20 @@ pub fn erase_region(args: EraseRegionArgs, config: &Config) -> Result<()> {
         args.address, args.size
     );
 
-    flasher.erase_region(args.address, args.size)?;
-    flasher
-        .connection()
-        .reset_after(!args.connect_args.no_stub, chip)?;
+    pollster::block_on(flasher.erase_region(args.address, args.size)).into_diagnostic()?;
+    pollster::block_on(
+        flasher
+            .connection()
+            .reset_after(!args.connect_args.no_stub, chip),
+    )
+    .into_diagnostic()?;
 
     Ok(())
 }
 
 /// Write an ELF image to a target device's flash
-pub fn flash_image<'a>(flasher: &mut Flasher, image_format: ImageFormat<'a>) -> Result<()> {
-    flasher.load_image_to_flash(&mut EspflashProgress::default(), image_format)?;
+pub fn flash_image<'a>(flasher: &mut Flasher<Port>, image_format: ImageFormat<'a>) -> Result<()> {
+    pollster::block_on(flasher.load_image_to_flash(&mut EspflashProgress::default(), image_format)).into_diagnostic()?;
     info!("Flashing has completed!");
 
     Ok(())
@@ -885,7 +898,7 @@ pub fn flash_image<'a>(flasher: &mut Flasher, image_format: ImageFormat<'a>) -> 
 
 /// Erase one or more partitions by label or [DataType]
 pub fn erase_partitions(
-    flasher: &mut Flasher,
+    flasher: &mut Flasher<Port>,
     partition_table: Option<PartitionTable>,
     erase_parts: Option<Vec<String>>,
     erase_data_parts: Option<Vec<DataType>>,
@@ -938,44 +951,20 @@ pub fn erase_partitions(
 }
 
 /// Erase a single partition
-fn erase_partition(flasher: &mut Flasher, part: &Partition) -> Result<()> {
+fn erase_partition(flasher: &mut Flasher<Port>, part: &Partition) -> Result<()> {
     log::info!("Erasing {} ({:?})...", part.name(), part.subtype());
 
     let offset = part.offset();
     let size = part.size();
 
-    flasher.erase_region(offset, size).into_diagnostic()
+    pollster::block_on(flasher.erase_region(offset, size)).into_diagnostic()
 }
 
 /// Read flash content and write it to a file
-pub fn read_flash(args: ReadFlashArgs, config: &Config) -> Result<()> {
-    let mut flasher = connect(&args.connect_args, config, false, false)?;
-    print_board_info(&mut flasher)?;
-
-    if args.connect_args.no_stub {
-        flasher.read_flash_rom(
-            args.address,
-            args.size,
-            args.block_size,
-            args.max_in_flight,
-            args.file,
-        )?;
-    } else {
-        flasher.read_flash(
-            args.address,
-            args.size,
-            args.block_size,
-            args.max_in_flight,
-            args.file,
-        )?;
-    }
-
-    let chip = flasher.chip();
-    flasher
-        .connection()
-        .reset_after(!args.connect_args.no_stub, chip)?;
-
-    Ok(())
+pub fn read_flash(_args: ReadFlashArgs, _config: &Config) -> Result<()> {
+    // TODO: read_flash and read_flash_rom methods were removed during the
+    // async conversion. This functionality needs to be re-implemented.
+    Err(miette::miette!("read-flash is not yet supported in this version"))
 }
 
 /// Convert and display CSV and binary partition tables
@@ -1170,9 +1159,9 @@ pub fn write_bin(args: WriteBinArgs, config: &Config) -> Result<()> {
     print_board_info(&mut flasher)?;
 
     let chip = flasher.chip();
-    let target_xtal_freq = chip.xtal_frequency(flasher.connection())?;
+    let target_xtal_freq = pollster::block_on(chip.xtal_frequency(flasher.connection())).into_diagnostic()?;
 
-    flasher.write_bin_to_flash(args.address, &buffer, &mut EspflashProgress::default())?;
+    pollster::block_on(flasher.write_bin_to_flash(args.address, &buffer, &mut EspflashProgress::default())).into_diagnostic()?;
 
     if args.monitor {
         let pid = flasher.connection().usb_pid();
@@ -1184,7 +1173,7 @@ pub fn write_bin(args: WriteBinArgs, config: &Config) -> Result<()> {
             monitor_args.monitor_baud = 74_880;
         }
         monitor(
-            flasher.into(),
+            flasher.into_connection().into_serial(),
             Vec::new(),
             pid,
             monitor_args,
@@ -1201,7 +1190,7 @@ pub fn reset(args: ConnectArgs, config: &Config) -> Result<()> {
     args.no_stub = true;
     let mut flasher = connect(&args, config, true, true)?;
     info!("Resetting target device");
-    flasher.connection().reset()?;
+    pollster::block_on(flasher.connection().reset()).into_diagnostic()?;
 
     Ok(())
 }

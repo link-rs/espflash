@@ -218,9 +218,12 @@ fn erase_parts(args: ErasePartsArgs, config: &Config) -> Result<()> {
     info!("Erasing the following partitions: {:?}", args.erase_parts);
 
     erase_partitions(&mut flasher, partition_table, Some(args.erase_parts), None)?;
-    flasher
-        .connection()
-        .reset_after(!args.connect_args.no_stub, chip)?;
+    pollster::block_on(
+        flasher
+            .connection()
+            .reset_after(!args.connect_args.no_stub, chip),
+    )
+    .into_diagnostic()?;
 
     info!("Specified partitions successfully erased!");
 
@@ -247,8 +250,8 @@ fn flash(args: FlashArgs, config: &Config) -> Result<()> {
         args.flash_args.no_verify,
         args.flash_args.no_skip,
     )?;
-    if !flasher.secure_download_mode() {
-        flasher.verify_minimum_revision(args.flash_args.image.min_chip_rev)?;
+    if !flasher.connection().is_secure_download_mode() {
+        pollster::block_on(flasher.verify_minimum_revision(args.flash_args.image.min_chip_rev)).into_diagnostic()?;
     }
 
     // If the user has provided a flash size via a command-line argument, we'll
@@ -260,7 +263,7 @@ fn flash(args: FlashArgs, config: &Config) -> Result<()> {
     }
 
     let chip = flasher.chip();
-    let target_xtal_freq = chip.xtal_frequency(flasher.connection())?;
+    let target_xtal_freq = pollster::block_on(chip.xtal_frequency(flasher.connection())).into_diagnostic()?;
 
     // Read the ELF data from the build path and load it to the target.
     let elf_data = fs::read(&args.image).into_diagnostic()?;
@@ -276,11 +279,11 @@ fn flash(args: FlashArgs, config: &Config) -> Result<()> {
     flash_config.flash_size = flash_config
         .flash_size // Use CLI argument if provided
         .or(config.project_config.flash.size) // If no CLI argument, try the config file
-        .or_else(|| flasher.flash_detect().ok().flatten()) // Try detecting flash size next
+        .or_else(|| pollster::block_on(flasher.flash_detect()).ok().flatten()) // Try detecting flash size next
         .or_else(|| Some(FlashSize::default())); // Otherwise, use a reasonable default value
 
     if args.flash_args.ram {
-        flasher.load_elf_to_ram(&elf_data, &mut EspflashProgress::default())?;
+        pollster::block_on(flasher.load_elf_to_ram(&elf_data, &mut EspflashProgress::default())).into_diagnostic()?;
     } else {
         let flash_data = make_flash_data(
             args.flash_args.image,
@@ -341,7 +344,7 @@ fn flash(args: FlashArgs, config: &Config) -> Result<()> {
         }
 
         monitor(
-            flasher.into(),
+            flasher.into_connection().into_serial(),
             elfs,
             pid,
             monitor_args,

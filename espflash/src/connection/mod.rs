@@ -925,6 +925,11 @@ impl<P: SerialInterface> Connection<P> {
         self.serial
     }
 
+    /// Returns whether the connection is in secure download mode.
+    pub fn is_secure_download_mode(&self) -> bool {
+        self.secure_download_mode
+    }
+
     /// Returns the USB PID of the serial port.
     pub fn usb_pid(&self) -> u16 {
         self.port_info.pid
