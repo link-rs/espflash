@@ -29,11 +29,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_debug_implementations, missing_docs, rust_2018_idioms)]
 
+extern crate alloc;
+
 pub use self::error::Error;
 
 pub mod command;
-#[cfg(feature = "serialport")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serialport")))]
 pub mod connection;
 pub mod flasher;
 pub mod image_format;

@@ -4,37 +4,25 @@
 //! application to a target device. It additionally provides some operations to
 //! read information from the target device.
 
-#[cfg(feature = "serialport")]
-use std::fs::OpenOptions;
+use alloc::borrow::Cow;
 use core::str::FromStr;
-#[cfg(feature = "serialport")]
-use std::{borrow::Cow, io::Write, path::PathBuf, thread::sleep, time::Duration};
 
-#[cfg(feature = "serialport")]
 use log::{debug, info, warn};
-#[cfg(feature = "serialport")]
-use md5::{Digest, Md5};
-#[cfg(feature = "serialport")]
 use object::{Endianness, read::elf::ElfFile32 as ElfFile};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, IntoEnumIterator, VariantNames};
 
-#[cfg(feature = "serialport")]
-use crate::connection::Port;
 // Re-export SecurityInfo from connection module for backward compatibility
 // TODO: Remove in the next major release
-#[cfg(feature = "serialport")]
 pub use crate::connection::SecurityInfo;
-#[cfg(feature = "serialport")]
 use crate::target::{DefaultProgressCallback, ProgressCallbacks};
 use crate::{
     Error,
     target::{Chip, XtalFrequency},
 };
-#[cfg(feature = "serialport")]
 use crate::{
     command::{Command, CommandType},
-    connection::{Connection, reset::ResetBeforeOperation},
+    connection::{Connection, SerialInterface, reset::ResetBeforeOperation},
     error::{ConnectionError, ResultExt as _},
     flasher::stubs::{
         CHIP_DETECT_MAGIC_REG_ADDR,
@@ -45,15 +33,12 @@ use crate::{
     image_format::{ImageFormat, Segment, ram_segments, rom_segments},
 };
 
-#[cfg(feature = "serialport")]
 pub(crate) mod stubs;
 
 /// List of SPI parameters to try while detecting flash size
-#[cfg(feature = "serialport")]
 pub(crate) const TRY_SPI_PARAMS: [SpiAttachParams; 2] =
     [SpiAttachParams::default(), SpiAttachParams::esp32_pico_d4()];
 
-#[cfg(feature = "serialport")]
 pub(crate) const FLASH_SECTOR_SIZE: usize = 0x1000;
 pub(crate) const FLASH_WRITE_SIZE: usize = 0x400;
 
@@ -508,16 +493,15 @@ impl DeviceInfo {
 }
 
 /// Connect to and flash a target device
-#[cfg(feature = "serialport")]
 #[derive(Debug)]
-pub struct Flasher {
+pub struct Flasher<P: SerialInterface> {
     /// Connection for flash operations
-    connection: Connection,
+    connection: Connection<P>,
     /// Chip ID
     chip: Chip,
     /// Flash size, loaded from SPI flash
     flash_size: FlashSize,
-    /// Configuration for SPI attached flash (0 to use fused values)
+    /// Configuration for SPI attached flash
     spi_params: SpiAttachParams,
     /// Indicate RAM stub loader is in use
     use_stub: bool,
@@ -527,35 +511,41 @@ pub struct Flasher {
     skip: bool,
 }
 
-#[cfg(feature = "serialport")]
-impl Flasher {
+impl<P: SerialInterface> Flasher<P> {
     /// The serial port's baud rate should be 115_200 to connect. After
     /// connecting, Flasher will change the baud rate to the `baud`
     /// parameter.
-    pub fn connect(
-        mut connection: Connection,
+    pub async fn connect(
+        mut connection: Connection<P>,
         use_stub: bool,
         verify: bool,
         skip: bool,
         chip: Option<Chip>,
         baud: Option<u32>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, (Connection<P>, Error)> {
         // The connection should already be established with the device using the
         // default baud rate of 115,200 and timeout of 3 seconds.
-        connection.begin()?;
-        connection.set_timeout(DEFAULT_TIMEOUT)?;
+        if let Err(e) = connection.begin().await {
+            return Err((connection, e));
+        }
+        if let Err(e) = connection.set_timeout(DEFAULT_TIMEOUT) {
+            return Err((connection, e));
+        }
 
-        detect_sdm(&mut connection);
+        detect_sdm(&mut connection).await;
 
         let detected_chip = if connection.before_operation() != ResetBeforeOperation::NoResetNoSync
         {
             // Detect which chip we are connected to.
-            let detected_chip = connection.detect_chip(use_stub)?;
+            let detected_chip = match connection.detect_chip(use_stub).await {
+                Ok(c) => c,
+                Err(e) => return Err((connection, e)),
+            };
             if let Some(chip) = chip {
                 if chip != detected_chip {
-                    return Err(Error::ChipMismatch(
-                        chip.to_string(),
-                        detected_chip.to_string(),
+                    return Err((
+                        connection,
+                        Error::ChipMismatch(chip.to_string(), detected_chip.to_string()),
                     ));
                 }
             }
@@ -565,7 +555,7 @@ impl Flasher {
         {
             chip.unwrap()
         } else {
-            return Err(Error::ChipNotProvided);
+            return Err((connection, Error::ChipNotProvided));
         };
 
         let mut flasher = Flasher {
@@ -586,10 +576,14 @@ impl Flasher {
             // Load flash stub if enabled.
             if use_stub {
                 info!("Using flash stub");
-                flasher.load_stub()?;
+                if let Err(e) = flasher.load_stub().await {
+                    return Err((flasher.into_connection(), e));
+                }
             }
             // Flash size autodetection doesn't work in Secure Download Mode.
-            flasher.spi_autodetect()?;
+            if let Err(e) = flasher.spi_autodetect().await {
+                return Err((flasher.into_connection(), e));
+            }
         } else if use_stub {
             warn!("Stub is not supported in Secure Download Mode, setting --no-stub");
             flasher.use_stub = false;
@@ -600,7 +594,9 @@ impl Flasher {
         if let Some(baud) = baud {
             if baud > 115_200 {
                 warn!("Setting baud rate higher than 115,200 can cause issues");
-                flasher.change_baud(baud)?;
+                if let Err(e) = flasher.change_baud(baud).await {
+                    return Err((flasher.into_connection(), e));
+                }
             }
         }
 
@@ -613,42 +609,24 @@ impl Flasher {
     }
 
     /// Disable the watchdog timer.
-    pub fn disable_watchdog(&mut self) -> Result<(), Error> {
+    pub async fn disable_watchdog(&mut self) -> Result<(), Error> {
         let mut target = self
             .chip
             .flash_target(self.spi_params, self.use_stub, false, false);
-        target.begin(&mut self.connection).flashing()?;
+        target.begin(&mut self.connection).await.flashing()?;
         Ok(())
     }
 
-    fn load_stub(&mut self) -> Result<(), Error> {
+    async fn load_stub(&mut self) -> Result<(), Error> {
         debug!("Loading flash stub for chip: {:?}", self.chip);
 
-        // Get chip revision for ESP32-P4 (needed to select correct stub)
-        let revision = if matches!(self.chip, Chip::Esp32p4) {
-            match self.chip.revision(&mut self.connection) {
-                Ok((major, minor)) => {
-                    // Calculate revision as major * 100 + minor (matching esptool format)
-                    let rev = major * 100 + minor;
-                    debug!("ESP32-P4 revision: v{major}.{minor} (calculated: {rev})");
-                    Some(rev)
-                }
-                Err(e) => {
-                    debug!("Failed to get ESP32-P4 revision: {e:?}, using default stub");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Load flash stub
-        let stub = FlashStub::get_with_rev(self.chip, revision);
+        let stub = FlashStub::get(self.chip);
 
         let mut ram_target = self
             .chip
             .ram_target(Some(stub.entry()), self.chip.max_ram_block_size());
-        ram_target.begin(&mut self.connection).flashing()?;
+        ram_target.begin(&mut self.connection).await.flashing()?;
 
         let (text_addr, text) = stub.text();
         debug!("Write {} byte stub text", text.len());
@@ -662,6 +640,7 @@ impl Flasher {
                 },
                 &mut DefaultProgressCallback,
             )
+            .await
             .flashing()?;
 
         let (data_addr, data) = stub.data();
@@ -676,14 +655,18 @@ impl Flasher {
                 },
                 &mut DefaultProgressCallback,
             )
+            .await
             .flashing()?;
 
         debug!("Finish stub write");
-        ram_target.finish(&mut self.connection, true).flashing()?;
+        ram_target
+            .finish(&mut self.connection, true)
+            .await
+            .flashing()?;
 
         debug!("Stub written!");
 
-        match self.connection.read(EXPECTED_STUB_HANDSHAKE.len())? {
+        match self.connection.read(EXPECTED_STUB_HANDSHAKE.len()).await? {
             Some(resp) if resp == EXPECTED_STUB_HANDSHAKE.as_bytes() => Ok(()),
             _ => Err(Error::Connection(Box::new(
                 ConnectionError::InvalidStubHandshake,
@@ -691,13 +674,13 @@ impl Flasher {
         }?;
 
         // Re-detect chip to check stub is up
-        let chip = self.connection.detect_chip(self.use_stub)?;
+        let chip = self.connection.detect_chip(self.use_stub).await?;
         debug!("Re-detected chip: {chip:?}");
 
         Ok(())
     }
 
-    fn spi_autodetect(&mut self) -> Result<(), Error> {
+    async fn spi_autodetect(&mut self) -> Result<(), Error> {
         // Loop over all available SPI parameters until we find one that successfully
         // reads the flash size.
         for spi_params in TRY_SPI_PARAMS.iter().copied() {
@@ -705,11 +688,11 @@ impl Flasher {
 
             // Send `SpiAttach` to enable flash, in some instances this command
             // may fail while the flash connection succeeds
-            if let Err(_e) = self.enable_flash(spi_params) {
+            if let Err(_e) = self.enable_flash(spi_params).await {
                 debug!("Flash enable failed");
             }
 
-            if let Some(flash_size) = self.flash_detect()? {
+            if let Some(flash_size) = self.flash_detect().await? {
                 debug!("Flash detect OK!");
 
                 // Flash detection was successful, so save the flash size and SPI parameters and
@@ -718,14 +701,18 @@ impl Flasher {
                 self.spi_params = spi_params;
 
                 let spi_set_params = SpiSetParams::default(self.flash_size.size());
-                self.connection.with_timeout(
-                    CommandType::SpiSetParams.timeout(),
-                    |connection| {
-                        connection.command(Command::SpiSetParams {
-                            spi_params: spi_set_params,
-                        })
-                    },
-                )?;
+                let old_timeout = self.connection.serial.timeout();
+                self.connection
+                    .serial
+                    .set_timeout(CommandType::SpiSetParams.timeout())?;
+                let result = self
+                    .connection
+                    .command(Command::SpiSetParams {
+                        spi_params: spi_set_params,
+                    })
+                    .await;
+                self.connection.serial.set_timeout(old_timeout)?;
+                result?;
 
                 return Ok(());
             }
@@ -740,10 +727,10 @@ impl Flasher {
     }
 
     /// Detect the flash size of the connected device.
-    pub fn flash_detect(&mut self) -> Result<Option<FlashSize>, Error> {
+    pub async fn flash_detect(&mut self) -> Result<Option<FlashSize>, Error> {
         const FLASH_RETRY: u8 = 0xFF;
 
-        let flash_id = self.spi_command(CommandType::FlashDetect, &[], 24)?;
+        let flash_id = self.spi_command(CommandType::FlashDetect, &[], 24).await?;
         let size_id = (flash_id >> 16) as u8;
 
         // This value indicates that an alternate detection method should be tried.
@@ -764,20 +751,26 @@ impl Flasher {
         Ok(Some(flash_size))
     }
 
-    fn enable_flash(&mut self, spi_params: SpiAttachParams) -> Result<(), Error> {
+    async fn enable_flash(&mut self, spi_params: SpiAttachParams) -> Result<(), Error> {
+        let old_timeout = self.connection.serial.timeout();
         self.connection
-            .with_timeout(CommandType::SpiAttach.timeout(), |connection| {
-                connection.command(if self.use_stub {
-                    Command::SpiAttachStub { spi_params }
-                } else {
-                    Command::SpiAttach { spi_params }
-                })
-            })?;
+            .serial
+            .set_timeout(CommandType::SpiAttach.timeout())?;
+        let result = self
+            .connection
+            .command(if self.use_stub {
+                Command::SpiAttachStub { spi_params }
+            } else {
+                Command::SpiAttach { spi_params }
+            })
+            .await;
+        self.connection.serial.set_timeout(old_timeout)?;
+        result?;
 
         Ok(())
     }
 
-    fn spi_command(
+    async fn spi_command(
         &mut self,
         command: CommandType,
         data: &[u8],
@@ -788,8 +781,8 @@ impl Flasher {
 
         let spi_registers = self.chip.spi_registers();
 
-        let old_spi_usr = self.connection.read_reg(spi_registers.usr())?;
-        let old_spi_usr2 = self.connection.read_reg(spi_registers.usr2())?;
+        let old_spi_usr = self.connection.read_reg(spi_registers.usr()).await?;
+        let old_spi_usr2 = self.connection.read_reg(spi_registers.usr2()).await?;
 
         let mut flags = 1 << 31;
         if !data.is_empty() {
@@ -800,20 +793,24 @@ impl Flasher {
         }
 
         self.connection
-            .write_reg(spi_registers.usr(), flags, None)?;
+            .write_reg(spi_registers.usr(), flags, None)
+            .await?;
         self.connection
-            .write_reg(spi_registers.usr2(), (7 << 28) | command as u32, None)?;
+            .write_reg(spi_registers.usr2(), (7 << 28) | command as u32, None)
+            .await?;
 
         if let (Some(mosi_data_length), Some(miso_data_length)) =
             (spi_registers.mosi_length(), spi_registers.miso_length())
         {
             if !data.is_empty() {
                 self.connection
-                    .write_reg(mosi_data_length, data.len() as u32 * 8 - 1, None)?;
+                    .write_reg(mosi_data_length, data.len() as u32 * 8 - 1, None)
+                    .await?;
             }
             if read_bits > 0 {
                 self.connection
-                    .write_reg(miso_data_length, read_bits - 1, None)?;
+                    .write_reg(miso_data_length, read_bits - 1, None)
+                    .await?;
             }
         } else {
             let mosi_mask = if data.is_empty() {
@@ -822,32 +819,38 @@ impl Flasher {
                 data.len() as u32 * 8 - 1
             };
             let miso_mask = if read_bits == 0 { 0 } else { read_bits - 1 };
-            self.connection.write_reg(
-                spi_registers.usr1(),
-                (miso_mask << 8) | (mosi_mask << 17),
-                None,
-            )?;
+            self.connection
+                .write_reg(
+                    spi_registers.usr1(),
+                    (miso_mask << 8) | (mosi_mask << 17),
+                    None,
+                )
+                .await?;
         }
 
         if data.is_empty() {
-            self.connection.write_reg(spi_registers.w0(), 0, None)?;
+            self.connection
+                .write_reg(spi_registers.w0(), 0, None)
+                .await?;
         } else {
             for (i, bytes) in data.chunks(4).enumerate() {
                 let mut data_bytes = [0; 4];
                 data_bytes[0..bytes.len()].copy_from_slice(bytes);
                 let data = u32::from_le_bytes(data_bytes);
                 self.connection
-                    .write_reg(spi_registers.w0() + i as u32, data, None)?;
+                    .write_reg(spi_registers.w0() + i as u32, data, None)
+                    .await?;
             }
         }
 
         self.connection
-            .write_reg(spi_registers.cmd(), 1 << 18, None)?;
+            .write_reg(spi_registers.cmd(), 1 << 18, None)
+            .await?;
 
         let mut i = 0;
         loop {
-            sleep(Duration::from_millis(1));
-            if self.connection.read_reg(spi_registers.usr())? & (1 << 18) == 0 {
+            self.connection.serial.delay_ms(1).await;
+            if self.connection.read_reg(spi_registers.usr()).await? & (1 << 18) == 0 {
                 break;
             }
             i += 1;
@@ -858,17 +861,19 @@ impl Flasher {
             }
         }
 
-        let result = self.connection.read_reg(spi_registers.w0())?;
+        let result = self.connection.read_reg(spi_registers.w0()).await?;
         self.connection
-            .write_reg(spi_registers.usr(), old_spi_usr, None)?;
+            .write_reg(spi_registers.usr(), old_spi_usr, None)
+            .await?;
         self.connection
-            .write_reg(spi_registers.usr2(), old_spi_usr2, None)?;
+            .write_reg(spi_registers.usr2(), old_spi_usr2, None)
+            .await?;
 
         Ok(result)
     }
 
     /// The active serial connection being used by the flasher
-    pub fn connection(&mut self) -> &mut Connection {
+    pub fn connection(&mut self) -> &mut Connection<P> {
         &mut self.connection
     }
 
@@ -877,29 +882,30 @@ impl Flasher {
         self.chip
     }
 
-    /// Whether the connected device is in Secure Download Mode.
-    pub fn secure_download_mode(&self) -> bool {
-        self.connection.secure_download_mode
-    }
-
     /// Read and print any information we can about the connected device
-    pub fn device_info(&mut self) -> Result<DeviceInfo, Error> {
+    pub async fn device_info(&mut self) -> Result<DeviceInfo, Error> {
         let chip = self.chip();
-        // chip_revision reads from efuse, which is not possible in Secure Download Mode
-        let revision = (!self.connection.secure_download_mode)
-            .then(|| chip.revision(self.connection()))
-            .transpose()?;
 
-        let crystal_frequency = chip.xtal_frequency(self.connection())?;
+        // chip_revision reads from efuse, which is not possible in Secure Download Mode
+        let revision = if !self.connection.secure_download_mode {
+            Some(chip.revision(&mut self.connection).await?)
+        } else {
+            None
+        };
+
+        let crystal_frequency = chip.xtal_frequency(&mut self.connection).await?;
         let features = chip
-            .chip_features(self.connection())?
+            .chip_features(&mut self.connection)
+            .await?
             .iter()
-            .map(|s| s.to_string())
+            .map(|s: &&str| s.to_string())
             .collect::<Vec<_>>();
 
-        let mac_address = (!self.connection.secure_download_mode)
-            .then(|| chip.mac_address(self.connection()))
-            .transpose()?;
+        let mac_address = if !self.connection.secure_download_mode {
+            Some(chip.mac_address(&mut self.connection).await?)
+        } else {
+            None
+        };
 
         let info = DeviceInfo {
             chip,
@@ -916,7 +922,7 @@ impl Flasher {
     /// Load an ELF image to RAM and execute it
     ///
     /// Note that this will not touch the flash on the device
-    pub fn load_elf_to_ram(
+    pub async fn load_elf_to_ram(
         &mut self,
         elf_data: &[u8],
         progress: &mut dyn ProgressCallbacks,
@@ -930,72 +936,49 @@ impl Flasher {
             Some(elf.elf_header().e_entry.get(Endianness::Little)),
             self.chip.max_ram_block_size(),
         );
-        target.begin(&mut self.connection).flashing()?;
+        target.begin(&mut self.connection).await.flashing()?;
 
         for segment in ram_segments(self.chip, &elf) {
             target
                 .write_segment(&mut self.connection, segment, progress)
+                .await
                 .flashing()?;
         }
 
-        target.finish(&mut self.connection, true).flashing()
-    }
-
-    /// Validate flash arguments when in secure download mode.
-    /// Prevent a user from accidentally flashing over a secure boot enabled
-    /// bootloader and bricking their device.
-    fn validate_secure_download_args(&self) -> Result<(), Error> {
-        if self.verify || self.skip {
-            warn!(
-                "Secure Download Mode enabled: `--verify` and `--skip` options are not available (flash read operations are restricted)"
-            );
-        }
-        Ok(())
+        target
+            .finish(&mut self.connection, true)
+            .await
+            .flashing()
     }
 
     /// Load an ELF image to flash and execute it
-    pub fn load_image_to_flash<'a>(
+    pub async fn load_image_to_flash<'a>(
         &mut self,
         progress: &mut dyn ProgressCallbacks,
         image_format: ImageFormat<'a>,
     ) -> Result<(), Error> {
-        let (mut verify, mut skip) = (self.verify, self.skip);
-
-        if self.connection.secure_download_mode {
-            self.validate_secure_download_args()?;
-            (verify, skip) = (false, false);
-        }
-
         let mut target = self
             .chip
-            .flash_target(self.spi_params, self.use_stub, verify, skip);
-        target.begin(&mut self.connection).flashing()?;
-
-        // When the `cli` feature is enabled, display the image size information.
-        #[cfg(feature = "cli")]
-        {
-            let metadata = image_format.metadata();
-            if metadata.contains_key("app_size") && metadata.contains_key("part_size") {
-                let app_size = metadata["app_size"].parse::<u32>()?;
-                let part_size = metadata["part_size"].parse::<u32>()?;
-
-                crate::cli::display_image_size(app_size, Some(part_size));
-            }
-        }
+            .flash_target(self.spi_params, self.use_stub, self.verify, self.skip);
+        target.begin(&mut self.connection).await.flashing()?;
 
         for segment in image_format.flash_segments() {
             target
                 .write_segment(&mut self.connection, segment, progress)
+                .await
                 .flashing()?;
         }
 
-        target.finish(&mut self.connection, true).flashing()?;
+        target
+            .finish(&mut self.connection, true)
+            .await
+            .flashing()?;
 
         Ok(())
     }
 
-    /// Load an bin image to flash at a specific address
-    pub fn write_bin_to_flash(
+    /// Load a bin image to flash at a specific address
+    pub async fn write_bin_to_flash(
         &mut self,
         addr: u32,
         data: &[u8],
@@ -1013,10 +996,10 @@ impl Flasher {
             segment
                 .data
                 .to_mut()
-                .extend(std::iter::repeat_n(0xFF, padded_bytes));
+                .extend(core::iter::repeat_n(0xFF, padded_bytes));
         }
 
-        self.write_bins_to_flash(&[segment], progress)?;
+        self.write_bins_to_flash(&[segment], progress).await?;
 
         info!("Binary successfully written to flash!");
 
@@ -1024,56 +1007,60 @@ impl Flasher {
     }
 
     /// Load multiple bin images to flash at specific addresses
-    pub fn write_bins_to_flash(
+    pub async fn write_bins_to_flash(
         &mut self,
         segments: &[Segment<'_>],
         progress: &mut dyn ProgressCallbacks,
     ) -> Result<(), Error> {
-        let (mut verify, mut skip) = (self.verify, self.skip);
-
         if self.connection.secure_download_mode {
-            self.validate_secure_download_args()?;
-            (verify, skip) = (false, false);
+            log::warn!("Secure Download Mode detected but proceeding anyway");
         }
 
         let mut target = self
             .chip
-            .flash_target(self.spi_params, self.use_stub, verify, skip);
+            .flash_target(self.spi_params, self.use_stub, self.verify, self.skip);
 
-        target.begin(&mut self.connection).flashing()?;
+        target.begin(&mut self.connection).await.flashing()?;
 
         for segment in segments {
-            target.write_segment(&mut self.connection, segment.borrow(), progress)?;
+            target
+                .write_segment(&mut self.connection, segment.borrow(), progress)
+                .await?;
         }
 
-        target.finish(&mut self.connection, true).flashing()?;
+        target
+            .finish(&mut self.connection, true)
+            .await
+            .flashing()?;
 
         Ok(())
     }
 
     /// Get MD5 of region
-    pub fn checksum_md5(&mut self, addr: u32, length: u32) -> Result<u128, Error> {
-        self.connection.with_timeout(
-            CommandType::FlashMd5.timeout_for_size(length),
-            |connection| {
-                connection
-                    .command(Command::FlashMd5 {
-                        offset: addr,
-                        size: length,
-                    })?
-                    .try_into()
-            },
-        )
+    pub async fn checksum_md5(&mut self, addr: u32, length: u32) -> Result<u128, Error> {
+        let old_timeout = self.connection.serial.timeout();
+        self.connection
+            .serial
+            .set_timeout(CommandType::FlashMd5.timeout_for_size(length))?;
+        let result = self
+            .connection
+            .command(Command::FlashMd5 {
+                offset: addr,
+                size: length,
+            })
+            .await;
+        self.connection.serial.set_timeout(old_timeout)?;
+        result?.try_into()
     }
 
     /// Get security info.
     // TODO: Deprecate this method in the next major release
-    pub fn security_info(&mut self) -> Result<SecurityInfo, Error> {
-        self.connection.security_info(self.use_stub)
+    pub async fn security_info(&mut self) -> Result<SecurityInfo, Error> {
+        self.connection.security_info(self.use_stub).await
     }
 
     /// Change the baud rate of the connection.
-    pub fn change_baud(&mut self, baud: u32) -> Result<(), Error> {
+    pub async fn change_baud(&mut self, baud: u32) -> Result<(), Error> {
         debug!("Change baud to: {baud}");
 
         let prior_baud = match self.use_stub {
@@ -1081,7 +1068,7 @@ impl Flasher {
             false => 0,
         };
 
-        let xtal_freq = self.chip.xtal_frequency(&mut self.connection)?;
+        let xtal_freq = self.chip.xtal_frequency(&mut self.connection).await?;
 
         // Probably this is just a temporary solution until the next chip revision.
         //
@@ -1092,188 +1079,72 @@ impl Flasher {
             new_baud = new_baud * 40 / 26;
         }
 
+        let old_timeout = self.connection.serial.timeout();
         self.connection
-            .with_timeout(CommandType::ChangeBaudrate.timeout(), |connection| {
-                connection.command(Command::ChangeBaudrate {
-                    new_baud,
-                    prior_baud,
-                })
-            })?;
-        self.connection.set_baud(baud)?;
-        sleep(Duration::from_secs_f32(0.05));
-        self.connection.flush()?;
+            .serial
+            .set_timeout(CommandType::ChangeBaudrate.timeout())?;
+        let result = self
+            .connection
+            .command(Command::ChangeBaudrate {
+                new_baud,
+                prior_baud,
+            })
+            .await;
+        self.connection.serial.set_timeout(old_timeout)?;
+        result?;
+
+        self.connection.set_baud(baud).await?;
+        self.connection.serial.delay_ms(50).await;
+        self.connection.flush().await?;
 
         Ok(())
     }
 
     /// Erase a region of flash.
-    pub fn erase_region(&mut self, offset: u32, size: u32) -> Result<(), Error> {
+    pub async fn erase_region(&mut self, offset: u32, size: u32) -> Result<(), Error> {
         debug!("Erasing region of 0x{size:x}B at 0x{offset:08x}");
 
-        self.connection.with_timeout(
-            CommandType::EraseRegion.timeout_for_size(size),
-            |connection| connection.command(Command::EraseRegion { offset, size }),
-        )?;
-        std::thread::sleep(Duration::from_secs_f32(0.05));
-        self.connection.flush()?;
+        let old_timeout = self.connection.serial.timeout();
+        self.connection
+            .serial
+            .set_timeout(CommandType::EraseRegion.timeout_for_size(size))?;
+        let result = self
+            .connection
+            .command(Command::EraseRegion { offset, size })
+            .await;
+        self.connection.serial.set_timeout(old_timeout)?;
+        result?;
+
+        self.connection.serial.delay_ms(50).await;
+        self.connection.flush().await?;
         Ok(())
     }
 
     /// Erase entire flash.
-    pub fn erase_flash(&mut self) -> Result<(), Error> {
+    pub async fn erase_flash(&mut self) -> Result<(), Error> {
         debug!("Erasing the entire flash");
 
+        let old_timeout = self.connection.serial.timeout();
         self.connection
-            .with_timeout(CommandType::EraseFlash.timeout(), |connection| {
-                connection.command(Command::EraseFlash)
-            })?;
-        sleep(Duration::from_secs_f32(0.05));
-        self.connection.flush()?;
+            .serial
+            .set_timeout(CommandType::EraseFlash.timeout())?;
+        let result = self
+            .connection
+            .command(Command::EraseFlash)
+            .await;
+        self.connection.serial.set_timeout(old_timeout)?;
+        result?;
 
-        Ok(())
-    }
-
-    /// Read the flash ROM and write it to a file.
-    pub fn read_flash_rom(
-        &mut self,
-        offset: u32,
-        size: u32,
-        block_size: u32,
-        max_in_flight: u32,
-        file_path: PathBuf,
-    ) -> Result<(), Error> {
-        // ROM read limit per command
-        const BLOCK_LEN: usize = 64;
-
-        let mut data: Vec<u8> = Vec::new();
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&file_path)?;
-
-        let mut correct_offset = offset;
-
-        while data.len() < size as usize {
-            let block_len = std::cmp::min(BLOCK_LEN, size as usize - data.len());
-
-            correct_offset += data.len() as u32;
-
-            let response = self.connection.with_timeout(
-                CommandType::ReadFlashSlow.timeout(),
-                |connection| {
-                    connection.command(Command::ReadFlashSlow {
-                        offset: correct_offset,
-                        size: block_len as u32,
-                        block_size,
-                        max_in_flight,
-                    })
-                },
-            )?;
-
-            let payload: Vec<u8> = response.try_into()?;
-
-            assert!(payload.len() >= block_len);
-
-            // command always returns 64 byte buffer,
-            // regardless of how many bytes were actually read from flash
-            data.append(&mut payload[..block_len].to_vec());
-        }
-
-        file.write_all(&data)?;
-
-        info!(
-            "Flash content successfully read and written to '{}'!",
-            file_path.display()
-        );
-
-        Ok(())
-    }
-
-    /// Read the flash and write it to a file.
-    pub fn read_flash(
-        &mut self,
-        offset: u32,
-        size: u32,
-        block_size: u32,
-        max_in_flight: u32,
-        file_path: PathBuf,
-    ) -> Result<(), Error> {
-        debug!("Reading 0x{size:x}B from 0x{offset:08x}");
-
-        let mut data = Vec::new();
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&file_path)?;
-
-        self.connection
-            .with_timeout(CommandType::ReadFlash.timeout(), |connection| {
-                connection.command(Command::ReadFlash {
-                    offset,
-                    size,
-                    block_size,
-                    max_in_flight,
-                })
-            })?;
-
-        while data.len() < size as usize {
-            let response = self.connection.read_flash_response()?;
-            let chunk: Vec<u8> = if let Some(response) = response {
-                response.value.try_into()?
-            } else {
-                return Err(Error::IncorrectResponse);
-            };
-
-            data.extend_from_slice(&chunk);
-
-            if data.len() < size as usize && chunk.len() < block_size as usize {
-                return Err(Error::CorruptData(block_size as usize, chunk.len()));
-            }
-
-            self.connection.write_raw(data.len() as u32)?;
-        }
-
-        if data.len() > size as usize {
-            return Err(Error::ReadMoreThanExpected);
-        }
-
-        let response = self.connection.read_flash_response()?;
-        let digest: Vec<u8> = if let Some(response) = response {
-            response.value.try_into()?
-        } else {
-            return Err(Error::IncorrectResponse);
-        };
-
-        if digest.len() != 16 {
-            return Err(Error::IncorrectDigestLength(digest.len()));
-        }
-
-        let mut md5_hasher = Md5::new();
-        md5_hasher.update(&data);
-        let checksum_md5 = md5_hasher.finalize();
-
-        if digest != checksum_md5[..] {
-            return Err(Error::DigestMismatch(digest, checksum_md5.to_vec()));
-        }
-
-        file.write_all(&data)?;
-
-        info!(
-            "Flash content successfully read and written to '{}'!",
-            file_path.display()
-        );
+        self.connection.serial.delay_ms(50).await;
+        self.connection.flush().await?;
 
         Ok(())
     }
 
     /// Verify the minimum chip revision.
-    pub fn verify_minimum_revision(&mut self, minimum: u16) -> Result<(), Error> {
+    pub async fn verify_minimum_revision(&mut self, minimum: u16) -> Result<(), Error> {
         let chip = self.chip;
-        let (major, minor) = chip.revision(self.connection())?;
+        let (major, minor) = chip.revision(&mut self.connection).await?;
         let revision = (major * 100 + minor) as u16;
         if revision < minimum {
             return Err(Error::UnsupportedChipRevision {
@@ -1288,37 +1159,23 @@ impl Flasher {
     }
 
     /// Consume self and return the underlying connection.
-    pub fn into_connection(self) -> Connection {
+    pub fn into_connection(self) -> Connection<P> {
         self.connection
     }
 }
 
-#[cfg(feature = "serialport")]
-fn detect_sdm(connection: &mut Connection) {
-    if let Ok(security_info) = connection.security_info(false) {
-        // Newer chips tell us if SDM is enabled.
+async fn detect_sdm<P: SerialInterface>(connection: &mut Connection<P>) {
+    if let Ok(security_info) = connection.security_info(false).await {
         connection.secure_download_mode =
             security_info.security_flag_status("SECURE_DOWNLOAD_ENABLE");
-    } else if connection.read_reg(CHIP_DETECT_MAGIC_REG_ADDR).is_err() {
-        // On older chips, we have to guess by reading something. On these chips, there
-        // is always something readable at 0x40001000.
+    } else if connection.read_reg(CHIP_DETECT_MAGIC_REG_ADDR).await.is_err() {
         log::warn!("Secure Download Mode is enabled on this chip");
         connection.secure_download_mode = true;
     }
 }
 
-#[cfg(feature = "serialport")]
-impl From<Flasher> for Connection {
-    fn from(flasher: Flasher) -> Self {
+impl<P: SerialInterface> From<Flasher<P>> for Connection<P> {
+    fn from(flasher: Flasher<P>) -> Self {
         flasher.into_connection()
-    }
-}
-
-#[cfg(feature = "serialport")]
-impl From<Flasher> for Port {
-    fn from(flasher: Flasher) -> Self {
-        // Enables `monitor(flasher.into(), …)`
-        let connection: Connection = flasher.into();
-        connection.into()
     }
 }

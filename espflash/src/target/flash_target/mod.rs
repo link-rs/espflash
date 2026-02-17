@@ -11,23 +11,45 @@
 mod esp32;
 mod ram;
 pub use self::{esp32::Esp32Target, ram::RamTarget};
-use crate::{Error, connection::Connection, image_format::Segment};
+use crate::{Error, connection::{Connection, SerialInterface}, image_format::Segment};
 
-/// Operations for interacting with a flash target.
-pub trait FlashTarget {
+/// Flash target enum - either ESP32 flash or RAM.
+pub enum FlashTarget {
+    /// Applications running from an ESP32's (or variant's) flash
+    Esp32(Esp32Target),
+    /// Applications running in the target device's RAM
+    Ram(RamTarget),
+}
+
+impl FlashTarget {
     /// Begin the flashing operation.
-    fn begin(&mut self, connection: &mut Connection) -> Result<(), Error>;
+    pub async fn begin<P: SerialInterface>(&mut self, connection: &mut Connection<P>) -> Result<(), Error> {
+        match self {
+            FlashTarget::Esp32(target) => target.begin(connection).await,
+            FlashTarget::Ram(target) => target.begin(connection).await,
+        }
+    }
 
     /// Write a segment to the target device.
-    fn write_segment(
+    pub async fn write_segment<P: SerialInterface>(
         &mut self,
-        connection: &mut Connection,
+        connection: &mut Connection<P>,
         segment: Segment<'_>,
         progress: &mut dyn ProgressCallbacks,
-    ) -> Result<(), Error>;
+    ) -> Result<(), Error> {
+        match self {
+            FlashTarget::Esp32(target) => target.write_segment(connection, segment, progress).await,
+            FlashTarget::Ram(target) => target.write_segment(connection, segment, progress).await,
+        }
+    }
 
     /// Complete the flashing operation.
-    fn finish(&mut self, connection: &mut Connection, reboot: bool) -> Result<(), Error>;
+    pub async fn finish<P: SerialInterface>(&mut self, connection: &mut Connection<P>, reboot: bool) -> Result<(), Error> {
+        match self {
+            FlashTarget::Esp32(target) => target.finish(connection, reboot).await,
+            FlashTarget::Ram(target) => target.finish(connection, reboot).await,
+        }
+    }
 }
 
 /// Progress update callbacks.

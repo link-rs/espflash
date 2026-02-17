@@ -1,19 +1,15 @@
 //! Library and application errors
 
-#[cfg(feature = "serialport")]
-use std::fmt::{Display, Formatter};
+use core::fmt::{Display, Formatter};
 use core::{array::TryFromSliceError, num::ParseIntError, str::Utf8Error};
 use std::io;
 
 use miette::Diagnostic;
-#[cfg(feature = "serialport")]
-use slip_codec::SlipError;
 use strum::VariantNames;
 use thiserror::Error;
 
 #[cfg(feature = "cli")]
 use crate::cli::monitor::parser::esp_defmt::DefmtError;
-#[cfg(feature = "serialport")]
 use crate::command::CommandType;
 use crate::{
     flasher::{FlashFrequency, FlashSize},
@@ -138,7 +134,7 @@ pub enum Error {
     )]
     InvalidFlashSize(String),
 
-    /// IO error
+    /// IO error (only when serialport feature is not enabled)
     #[cfg(not(feature = "serialport"))]
     #[error(transparent)]
     IoError(#[from] io::Error),
@@ -263,7 +259,6 @@ pub enum Error {
 
     /// The bootloader returned an error
     #[error("The bootloader returned an error")]
-    #[cfg(feature = "serialport")]
     RomError(CoreError),
 
     /// The selected partition does not exist in the partition table
@@ -391,9 +386,9 @@ pub enum Error {
 }
 
 #[cfg(feature = "serialport")]
-impl From<SlipError> for Error {
-    fn from(err: SlipError) -> Self {
-        let conn_err: ConnectionError = err.into(); // uses first impl
+impl From<slip_codec::SlipError> for Error {
+    fn from(err: slip_codec::SlipError) -> Self {
+        let conn_err: ConnectionError = err.into();
         Self::Connection(Box::new(conn_err))
     }
 }
@@ -413,7 +408,6 @@ impl From<serialport::Error> for Error {
     }
 }
 
-#[cfg(feature = "serialport")]
 impl From<crate::connection::SerialPortError> for Error {
     fn from(err: crate::connection::SerialPortError) -> Self {
         use crate::connection::SerialPortErrorKind;
@@ -422,10 +416,7 @@ impl From<crate::connection::SerialPortError> for Error {
                 ConnectionError::Timeout(TimedOutCommand::default())
             }
             SerialPortErrorKind::NoDevice => ConnectionError::DeviceNotFound,
-            _ => ConnectionError::Serial(serialport::Error::new(
-                serialport::ErrorKind::Io(io::ErrorKind::Other),
-                err.description,
-            )),
+            _ => ConnectionError::Serial(err),
         };
         Self::Connection(Box::new(conn_err))
     }
@@ -493,7 +484,6 @@ pub(crate) enum AppDescriptorError {
 /// Connection-related errors.
 #[derive(Debug, Diagnostic, Error)]
 #[non_exhaustive]
-#[cfg(feature = "serialport")]
 pub(crate) enum ConnectionError {
     #[error("Failed to connect to the device")]
     #[diagnostic(
@@ -545,15 +535,13 @@ pub(crate) enum ConnectionError {
     #[diagnostic(code(espflash::read_mismatch))]
     ReadMismatch(u32, u32),
 
-    #[cfg(feature = "serialport")]
     #[error("Timeout while running {0}command")]
     #[diagnostic(code(espflash::timeout))]
     Timeout(TimedOutCommand),
 
-    #[cfg(feature = "serialport")]
-    #[error("IO error while using serial port: {0}")]
+    #[error("Serial error: {0}")]
     #[diagnostic(code(espflash::serial_error))]
-    Serial(#[source] serialport::Error),
+    Serial(crate::connection::SerialPortError),
 
     #[error("Wrong boot mode detected ({0})! The chip needs to be in download mode.")]
     #[diagnostic(code(espflash::wrong_boot_mode))]
@@ -576,33 +564,45 @@ impl From<serialport::Error> for ConnectionError {
         match err.kind() {
             ErrorKind::Io(kind) => from_error_kind(kind, err),
             ErrorKind::NoDevice => ConnectionError::DeviceNotFound,
+            _ => ConnectionError::Serial(crate::connection::SerialPortError {
+                kind: crate::connection::SerialPortErrorKind::Unknown,
+                description: err.to_string(),
+            }),
+        }
+    }
+}
+
+impl From<crate::connection::SerialPortError> for ConnectionError {
+    fn from(err: crate::connection::SerialPortError) -> Self {
+        use crate::connection::SerialPortErrorKind;
+        match err.kind {
+            SerialPortErrorKind::Timeout => ConnectionError::Timeout(TimedOutCommand::default()),
+            SerialPortErrorKind::NoDevice => ConnectionError::DeviceNotFound,
             _ => ConnectionError::Serial(err),
         }
     }
 }
 
 #[cfg(feature = "serialport")]
-impl From<SlipError> for ConnectionError {
-    fn from(err: SlipError) -> Self {
+impl From<slip_codec::SlipError> for ConnectionError {
+    fn from(err: slip_codec::SlipError) -> Self {
         match err {
-            SlipError::FramingError => Self::FramingError,
-            SlipError::OversizedPacket => Self::OverSizedPacket,
-            SlipError::ReadError(io) => Self::from(io),
-            SlipError::EndOfStream => Self::FramingError,
+            slip_codec::SlipError::FramingError => Self::FramingError,
+            slip_codec::SlipError::OversizedPacket => Self::OverSizedPacket,
+            slip_codec::SlipError::ReadError(io) => Self::from(io),
+            slip_codec::SlipError::EndOfStream => Self::FramingError,
         }
     }
 }
 
 /// An executed command which has timed out.
 #[derive(Clone, Debug, Default)]
-#[cfg(feature = "serialport")]
 pub(crate) struct TimedOutCommand {
     command: Option<CommandType>,
 }
 
-#[cfg(feature = "serialport")]
 impl Display for TimedOutCommand {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match &self.command {
             Some(command) => write!(f, "{command} "),
             None => Ok(()),
@@ -610,7 +610,6 @@ impl Display for TimedOutCommand {
     }
 }
 
-#[cfg(feature = "serialport")]
 impl From<CommandType> for TimedOutCommand {
     fn from(ct: CommandType) -> Self {
         TimedOutCommand { command: Some(ct) }
@@ -621,7 +620,6 @@ impl From<CommandType> for TimedOutCommand {
 #[derive(Clone, Copy, Debug, Default, Diagnostic, Error, strum::FromRepr)]
 #[non_exhaustive]
 #[repr(u8)]
-#[cfg(feature = "serialport")]
 pub(crate) enum RomErrorKind {
     #[error("Invalid message received")]
     #[diagnostic(code(espflash::rom::invalid_message))]
@@ -697,7 +695,6 @@ pub(crate) enum RomErrorKind {
     Other = 0xff,
 }
 
-#[cfg(feature = "serialport")]
 impl From<u8> for RomErrorKind {
     fn from(raw: u8) -> Self {
         Self::from_repr(raw).unwrap_or_default()
@@ -707,7 +704,6 @@ impl From<u8> for RomErrorKind {
 /// An error originating from a device's ROM functionality.
 #[derive(Clone, Copy, Debug, Diagnostic, Error)]
 #[error("Error while running {command} command")]
-#[cfg(feature = "serialport")]
 #[non_exhaustive]
 pub(crate) struct RomError {
     command: CommandType,
@@ -715,7 +711,6 @@ pub(crate) struct RomError {
     kind: RomErrorKind,
 }
 
-#[cfg(feature = "serialport")]
 impl RomError {
     /// Create a new [RomError].
     pub(crate) fn new(command: CommandType, kind: RomErrorKind) -> RomError {
@@ -751,7 +746,6 @@ impl From<String> for MissingPartition {
 pub(crate) struct MissingPartitionTable;
 
 /// Extension helpers.
-#[cfg(feature = "serialport")]
 pub(crate) trait ResultExt {
     /// Mark an error as having occurred during the flashing stage.
     fn flashing(self) -> Self;
@@ -759,7 +753,6 @@ pub(crate) trait ResultExt {
     fn for_command(self, command: CommandType) -> Self;
 }
 
-#[cfg(feature = "serialport")]
 impl<T> ResultExt for Result<T, Error> {
     fn flashing(self) -> Self {
         match self {
@@ -800,6 +793,12 @@ where
     match kind {
         ErrorKind::TimedOut => ConnectionError::Timeout(TimedOutCommand::default()),
         ErrorKind::NotFound => ConnectionError::DeviceNotFound,
-        _ => ConnectionError::Serial(err.into()),
+        _ => {
+            let se = err.into();
+            ConnectionError::Serial(crate::connection::SerialPortError {
+                kind: crate::connection::SerialPortErrorKind::Unknown,
+                description: se.to_string(),
+            })
+        }
     }
 }

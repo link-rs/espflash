@@ -4,13 +4,11 @@
 //! target device's RAM.
 
 use crate::{Error, image_format::Segment, target::MAX_RAM_BLOCK_SIZE};
-#[cfg(feature = "serialport")]
 use crate::{
     command::{Command, CommandType},
-    connection::Connection,
-    target::FlashTarget,
-    target::ProgressCallbacks,
+    connection::{Connection, SerialInterface},
 };
+use super::ProgressCallbacks;
 
 /// Applications running in the target device's RAM.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -32,15 +30,16 @@ impl Default for RamTarget {
     }
 }
 
-#[cfg(feature = "serialport")]
-impl FlashTarget for RamTarget {
-    fn begin(&mut self, _connection: &mut Connection) -> Result<(), Error> {
+impl RamTarget {
+    /// Begin the flashing operation.
+    pub async fn begin<P: SerialInterface>(&mut self, _connection: &mut Connection<P>) -> Result<(), Error> {
         Ok(())
     }
 
-    fn write_segment(
+    /// Write a segment to the target device.
+    pub async fn write_segment<P: SerialInterface>(
         &mut self,
-        connection: &mut Connection,
+        connection: &mut Connection<P>,
         segment: Segment<'_>,
         progress: &mut dyn ProgressCallbacks,
     ) -> Result<(), Error> {
@@ -55,7 +54,7 @@ impl FlashTarget for RamTarget {
             block_size: self.block_size as u32,
             offset: addr,
             supports_encryption: false,
-        })?;
+        }).await?;
 
         let chunks = segment.data.chunks(self.block_size);
         let num_chunks = chunks.len();
@@ -68,7 +67,7 @@ impl FlashTarget for RamTarget {
                 pad_to: 4,
                 pad_byte: 0,
                 data: block,
-            })?;
+            }).await?;
 
             progress.update(i + 1)
         }
@@ -78,15 +77,18 @@ impl FlashTarget for RamTarget {
         Ok(())
     }
 
-    fn finish(&mut self, connection: &mut Connection, reboot: bool) -> Result<(), Error> {
+    /// Complete the flashing operation.
+    pub async fn finish<P: SerialInterface>(&mut self, connection: &mut Connection<P>, reboot: bool) -> Result<(), Error> {
         if reboot {
             let entry = self.entry.unwrap_or_default();
-            connection.with_timeout(CommandType::MemEnd.timeout(), |connection| {
-                connection.command(Command::MemEnd {
-                    no_entry: entry == 0,
-                    entry,
-                })
-            })?;
+            let old_timeout = connection.serial.timeout();
+            connection.serial.set_timeout(CommandType::MemEnd.timeout())?;
+            let result = connection.command(Command::MemEnd {
+                no_entry: entry == 0,
+                entry,
+            }).await;
+            connection.serial.set_timeout(old_timeout)?;
+            result?;
         }
 
         Ok(())
