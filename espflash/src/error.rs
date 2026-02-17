@@ -413,6 +413,24 @@ impl From<serialport::Error> for Error {
     }
 }
 
+#[cfg(feature = "serialport")]
+impl From<crate::connection::SerialPortError> for Error {
+    fn from(err: crate::connection::SerialPortError) -> Self {
+        use crate::connection::SerialPortErrorKind;
+        let conn_err = match err.kind {
+            SerialPortErrorKind::Timeout => {
+                ConnectionError::Timeout(TimedOutCommand::default())
+            }
+            SerialPortErrorKind::NoDevice => ConnectionError::DeviceNotFound,
+            _ => ConnectionError::Serial(serialport::Error::new(
+                serialport::ErrorKind::Io(io::ErrorKind::Other),
+                err.description,
+            )),
+        };
+        Self::Connection(Box::new(conn_err))
+    }
+}
+
 impl From<TryFromSliceError> for Error {
     fn from(err: TryFromSliceError) -> Self {
         Self::TryFromSlice(Box::new(err))

@@ -55,6 +55,137 @@ pub type Port = serialport::TTYPort;
 /// Alias for the serial COMPort.
 pub type Port = serialport::COMPort;
 
+/// Buffer type for clear operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearBufferType {
+    /// Clear the input buffer.
+    Input,
+    /// Clear the output buffer.
+    Output,
+    /// Clear both buffers.
+    All,
+}
+
+/// Serial port error kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialPortErrorKind {
+    /// No device found
+    NoDevice,
+    /// Invalid input
+    InvalidInput,
+    /// Unknown error
+    Unknown,
+    /// I/O error
+    Io,
+    /// Timeout
+    Timeout,
+}
+
+/// Serial port error type.
+#[derive(Debug)]
+pub struct SerialPortError {
+    /// Error kind
+    pub kind: SerialPortErrorKind,
+    /// Error description
+    pub description: String,
+}
+
+impl SerialPortError {
+    /// Create a new serial port error.
+    pub fn new(kind: SerialPortErrorKind, description: impl Into<String>) -> Self {
+        Self {
+            kind,
+            description: description.into(),
+        }
+    }
+
+    /// Create an I/O error.
+    pub fn io(description: impl Into<String>) -> Self {
+        Self::new(SerialPortErrorKind::Io, description)
+    }
+
+    /// Create a timeout error.
+    pub fn timeout(description: impl Into<String>) -> Self {
+        Self::new(SerialPortErrorKind::Timeout, description)
+    }
+}
+
+impl fmt::Display for SerialPortError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.description)
+    }
+}
+
+impl std::error::Error for SerialPortError {}
+
+/// USB port information.
+#[derive(Debug, Clone, Default)]
+pub struct PortInfo {
+    /// USB Vendor ID
+    pub vid: u16,
+    /// USB Product ID
+    pub pid: u16,
+    /// Serial number
+    pub serial_number: Option<String>,
+    /// Manufacturer
+    pub manufacturer: Option<String>,
+    /// Product name
+    pub product: Option<String>,
+}
+
+/// Async serial port interface.
+///
+/// This trait provides an async interface for serial port operations,
+/// allowing implementations for both native serial ports (via `serialport`
+/// crate) and WebSerial.
+///
+/// Note: We intentionally use `async fn` in this trait without `Send` bounds
+/// to support WebSerial implementations where futures are not `Send`.
+#[allow(async_fn_in_trait)]
+pub trait SerialInterface {
+    /// Get the port name (e.g., "/dev/ttyUSB0" or "COM3").
+    fn name(&self) -> Option<String>;
+
+    /// Get the current baud rate.
+    fn baud_rate(&self) -> Result<u32, SerialPortError>;
+
+    /// Set the baud rate.
+    async fn set_baud_rate(&mut self, baud_rate: u32) -> Result<(), SerialPortError>;
+
+    /// Get the current timeout duration.
+    fn timeout(&self) -> Duration;
+
+    /// Set the timeout duration.
+    fn set_timeout(&mut self, timeout: Duration) -> Result<(), SerialPortError>;
+
+    /// Get the number of bytes available to read.
+    fn bytes_to_read(&self) -> Result<u32, SerialPortError>;
+
+    /// Read data from the serial port.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, SerialPortError>;
+
+    /// Write data to the serial port.
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, SerialPortError>;
+
+    /// Write all data to the serial port.
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), SerialPortError>;
+
+    /// Flush the output buffer.
+    async fn flush(&mut self) -> Result<(), SerialPortError>;
+
+    /// Clear the specified buffer(s).
+    async fn clear(&mut self, buffer_to_clear: ClearBufferType) -> Result<(), SerialPortError>;
+
+    /// Set the DTR (Data Terminal Ready) signal.
+    async fn write_data_terminal_ready(&mut self, level: bool) -> Result<(), SerialPortError>;
+
+    /// Set the RTS (Request To Send) signal.
+    async fn write_request_to_send(&mut self, level: bool) -> Result<(), SerialPortError>;
+
+    /// Delay for the specified number of milliseconds.
+    async fn delay_ms(&mut self, ms: u32);
+}
+
 /// Security Info Response containing chip security information
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct SecurityInfo {
