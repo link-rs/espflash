@@ -1,6 +1,6 @@
 //! Image format metadata.
 
-use std::{collections::HashMap, error::Error};
+use std::{collections::BTreeMap, error::Error};
 
 use object::{File, Object, ObjectSection, ObjectSymbol};
 use serde::{Deserialize, Serialize};
@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 /// Image format metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Metadata {
-    symbols: HashMap<String, Vec<u8>>,
+    symbols: BTreeMap<String, Vec<u8>>,
 }
 
 impl Metadata {
     /// Creates an empty [`Metadata`].
     fn empty() -> Self {
         Self {
-            symbols: HashMap::new(),
+            symbols: BTreeMap::new(),
         }
     }
 

@@ -2,7 +2,8 @@
 
 #[cfg(feature = "serialport")]
 use std::fmt::{Display, Formatter};
-use std::{array::TryFromSliceError, io, num::ParseIntError, str::Utf8Error};
+use core::{array::TryFromSliceError, num::ParseIntError, str::Utf8Error};
+use std::io;
 
 use miette::Diagnostic;
 #[cfg(feature = "serialport")]

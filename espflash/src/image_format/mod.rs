@@ -1,9 +1,9 @@
 //! Binary application image formats
 
-use std::{
-    borrow::Cow,
+use std::{borrow::Cow, collections::BTreeMap};
+
+use core::{
     cmp::Ordering,
-    collections::HashMap,
     fmt::{Debug, Formatter},
     mem::take,
     ops::AddAssign,
@@ -62,7 +62,7 @@ impl<'a> ImageFormat<'a> {
     }
 
     /// Returns metadata about the application image
-    pub fn metadata(&self) -> HashMap<&str, String> {
+    pub fn metadata(&self) -> BTreeMap<&str, String> {
         match self {
             ImageFormat::EspIdf(idf) => idf.metadata(),
         }

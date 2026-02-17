@@ -1,6 +1,7 @@
 //! Commands to work with a flasher stub running on a target device
 
-use std::{io::Write, mem::size_of, time::Duration};
+use core::{mem::size_of, time::Duration};
+use std::io::Write;
 
 use bytemuck::{Pod, Zeroable, bytes_of};
 use serde::{Deserialize, Serialize};

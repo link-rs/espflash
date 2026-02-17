@@ -5,7 +5,7 @@
 //! device.
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt,
     io::{BufWriter, Read, Write},
     iter::zip,
@@ -71,8 +71,8 @@ pub struct SecurityInfo {
 }
 
 impl SecurityInfo {
-    fn security_flag_map() -> HashMap<&'static str, u32> {
-        HashMap::from([
+    fn security_flag_map() -> BTreeMap<&'static str, u32> {
+        BTreeMap::from([
             ("SECURE_BOOT_EN", 1 << 0),
             ("SECURE_BOOT_AGGRESSIVE_REVOKE", 1 << 1),
             ("SECURE_DOWNLOAD_ENABLE", 1 << 2),

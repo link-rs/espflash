@@ -4,7 +4,7 @@
 //! possible to write an application to and boot from RAM, where a bootloader is
 //! obviously not required either.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, VariantNames};
@@ -935,10 +935,10 @@ impl Chip {
     }
 
     /// Numeric encodings for the flash frequencies supported by a chip
-    pub fn flash_frequency_encodings(&self) -> HashMap<FlashFrequency, u8> {
+    pub fn flash_frequency_encodings(&self) -> BTreeMap<FlashFrequency, u8> {
         use FlashFrequency::*;
 
-        HashMap::from(match self {
+        BTreeMap::from(match self {
             Chip::Esp32h2 => [(_12Mhz, 0x2), (_16Mhz, 0x1), (_24Mhz, 0x0), (_48Mhz, 0xF)],
             Chip::Esp32c2 => [(_15Mhz, 0x2), (_20Mhz, 0x1), (_30Mhz, 0x0), (_60Mhz, 0xF)],
             _ => [(_20Mhz, 0x2), (_26Mhz, 0x1), (_40Mhz, 0x0), (_80Mhz, 0xf)],

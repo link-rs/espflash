@@ -6,7 +6,7 @@
 
 #[cfg(feature = "serialport")]
 use std::fs::OpenOptions;
-use std::str::FromStr;
+use core::str::FromStr;
 #[cfg(feature = "serialport")]
 use std::{borrow::Cow, io::Write, path::PathBuf, thread::sleep, time::Duration};
 
@@ -62,7 +62,7 @@ pub(crate) const FLASH_WRITE_SIZE: usize = 0x400;
 /// Note that not all frequencies are supported by each target device.
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(
-    Debug, Default, Clone, Copy, Hash, PartialEq, Eq, Display, VariantNames, Serialize, Deserialize,
+    Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Display, VariantNames, Serialize, Deserialize,
 )]
 #[non_exhaustive]
 #[repr(u8)]
