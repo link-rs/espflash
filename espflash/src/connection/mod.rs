@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, fmt, iter::zip, time::Duration};
 
 use embedded_io_async::Write;
 use log::{debug, info};
+#[cfg(feature = "serialport")]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +34,10 @@ const MAX_CONNECT_ATTEMPTS: usize = 7;
 const MAX_SYNC_ATTEMPTS: usize = 5;
 pub(crate) const USB_SERIAL_JTAG_PID: u16 = 0x1001;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "serialport"))]
 /// Alias for the serial TTYPort.
 pub type Port = serialport::TTYPort;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "serialport"))]
 /// Alias for the serial COMPort.
 pub type Port = serialport::COMPort;
 
@@ -494,8 +495,11 @@ impl<P: SerialInterface> Connection<P> {
         if self.before_operation == ResetBeforeOperation::NoResetNoSync {
             return Ok(());
         }
+        #[allow(unused_mut)]
         let mut download_mode: bool = false;
+        #[allow(unused_mut)]
         let mut boot_mode = String::new();
+        #[allow(unused_mut)]
         let mut boot_log_detected = false;
         let mut buff: Vec<u8>;
         if self.before_operation != ResetBeforeOperation::NoReset {
@@ -521,21 +525,28 @@ impl<P: SerialInterface> Connection<P> {
 
             let read_slice = String::from_utf8_lossy(&buff[..read_bytes as usize]).into_owned();
 
-            let pattern =
-                Regex::new(r"boot:(0x[0-9a-fA-F]+)([\s\S]*waiting for download)?").unwrap();
+            #[cfg(feature = "serialport")]
+            {
+                let pattern =
+                    Regex::new(r"boot:(0x[0-9a-fA-F]+)([\s\S]*waiting for download)?").unwrap();
 
-            if let Some(data) = pattern.captures(&read_slice) {
-                boot_log_detected = true;
-                boot_mode = data
-                    .get(1)
-                    .map(|m| m.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                download_mode = data.get(2).is_some();
+                if let Some(data) = pattern.captures(&read_slice) {
+                    boot_log_detected = true;
+                    boot_mode = data
+                        .get(1)
+                        .map(|m| m.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    download_mode = data.get(2).is_some();
 
-                debug!("Boot Mode: {boot_mode}");
-                debug!("Download Mode: {download_mode}");
-            };
+                    debug!("Boot Mode: {boot_mode}");
+                    debug!("Download Mode: {download_mode}");
+                }
+            }
+            #[cfg(not(feature = "serialport"))]
+            {
+                let _ = &read_slice;
+            }
         }
 
         for _ in 0..MAX_SYNC_ATTEMPTS {
@@ -886,6 +897,7 @@ impl<P: SerialInterface> Connection<P> {
 
     /// Updates a register by applying the new value to the masked out portion
     /// of the old value.
+    #[allow(dead_code)]
     pub(crate) async fn update_reg(
         &mut self,
         addr: u32,

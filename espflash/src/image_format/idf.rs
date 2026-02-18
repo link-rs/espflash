@@ -1,7 +1,7 @@
 //! ESP-IDF application binary image format
 
 use core::{ffi::c_char, iter::once, mem::size_of};
-use std::{borrow::Cow, collections::BTreeMap, fs, io::Write, path::Path};
+use std::{borrow::Cow, collections::BTreeMap, io::Write};
 
 use bytemuck::{Pod, Zeroable, bytes_of, from_bytes, pod_read_unaligned};
 use esp_idf_part::{AppType, DataType, Flags, Partition, PartitionTable, SubType, Type};
@@ -251,17 +251,15 @@ impl<'a> IdfBootloaderFormat<'a> {
     pub fn new(
         elf_data: &'a [u8],
         flash_data: &FlashData,
-        partition_table_path: Option<&Path>,
-        bootloader_path: Option<&Path>,
+        partition_table_data: Option<&[u8]>,
+        bootloader_data: Option<&[u8]>,
         partition_table_offset: Option<u32>,
         target_app_partition: Option<&str>,
     ) -> Result<Self, Error> {
         let elf = ElfFile::parse(elf_data)?;
 
-        let partition_table = if let Some(partition_table_path) = partition_table_path {
-            let data = fs::read(partition_table_path)
-                .map_err(|e| Error::FileOpenError(partition_table_path.display().to_string(), e))?;
-            PartitionTable::try_from(data)?
+        let partition_table = if let Some(data) = partition_table_data {
+            PartitionTable::try_from(data.to_vec())?
         } else {
             default_partition_table(
                 flash_data.chip,
@@ -281,9 +279,8 @@ impl<'a> IdfBootloaderFormat<'a> {
             ));
         }
 
-        let mut bootloader = if let Some(bootloader_path) = bootloader_path {
-            let bootloader = fs::read(bootloader_path)?;
-            Cow::Owned(bootloader)
+        let mut bootloader = if let Some(data) = bootloader_data {
+            Cow::Owned(data.to_vec())
         } else {
             let default_bootloader = default_bootloader(flash_data.chip, flash_data.xtal_freq)?;
             Cow::Borrowed(default_bootloader)

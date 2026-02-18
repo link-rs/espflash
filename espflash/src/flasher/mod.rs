@@ -621,7 +621,7 @@ impl<P: SerialInterface> Flasher<P> {
         debug!("Loading flash stub for chip: {:?}", self.chip);
 
         // Load flash stub
-        let stub = FlashStub::get(self.chip);
+        let stub = FlashStub::get_with_rev(self.chip, None);
 
         let mut ram_target = self
             .chip

@@ -26,7 +26,6 @@ use crate::{
     flasher::{FLASH_WRITE_SIZE, FlashFrequency, SpiAttachParams},
     target::efuse::EfuseBlock,
 };
-#[cfg(feature = "serialport")]
 use crate::target::efuse::{EfuseBlockErrors, EfuseField};
 
 pub mod efuse;

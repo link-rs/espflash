@@ -484,6 +484,7 @@ pub(crate) enum AppDescriptorError {
 /// Connection-related errors.
 #[derive(Debug, Diagnostic, Error)]
 #[non_exhaustive]
+#[allow(dead_code)]
 pub(crate) enum ConnectionError {
     #[error("Failed to connect to the device")]
     #[diagnostic(

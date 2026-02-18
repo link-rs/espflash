@@ -1094,14 +1094,26 @@ pub fn make_image_format<'a>(
                     .clone()
                     .or(build_ctx_partition_table);
             }
-            IdfBootloaderFormat::new(
-                elf_data,
-                flash_data,
-                args.partition_table.as_deref(),
-                args.bootloader.as_deref(),
-                args.partition_table_offset,
-                args.target_app_partition.as_deref(),
-            )?
+            {
+                let partition_table_data = args
+                    .partition_table
+                    .as_ref()
+                    .map(|p| std::fs::read(p))
+                    .transpose()?;
+                let bootloader_data = args
+                    .bootloader
+                    .as_ref()
+                    .map(|p| std::fs::read(p))
+                    .transpose()?;
+                IdfBootloaderFormat::new(
+                    elf_data,
+                    flash_data,
+                    partition_table_data.as_deref(),
+                    bootloader_data.as_deref(),
+                    args.partition_table_offset,
+                    args.target_app_partition.as_deref(),
+                )?
+            }
         }
     };
 
